@@ -2,10 +2,10 @@
 from flask import Flask, jsonify, abort, send_file, request
 import os
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
 from sqlalchemy.exc import OperationalError
 
 _engine = None
+
 
 def get_engine():
     """
@@ -14,22 +14,26 @@ def get_engine():
     global _engine
     if _engine is not None:
         return _engine
-    db_url = os.getenv("DB_URL")
+
+    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("Missing DB_URL (or DATABASE_URL) environment variable.")
+        raise RuntimeError("Missing DB_URL or DATABASE_URL environment variable.")
+
     # Normalize old 'postgres://' scheme to 'postgresql://'
     if db_url.startswith("postgres://"):
         db_url = "postgresql://" + db_url[len("postgres://"):]
+
     _engine = create_engine(
         db_url,
         pool_pre_ping=True,
     )
     return _engine
 
+
 def parse_coords(coords_str: str):
     """
-    Parses a coordinate string like "x_y_z" into a tuple of floats.
-    Returns (x, y, z) or None if the format is invalid.
+    Parses a coordinate string like 'x_y_z' into a tuple of floats.
+    Returns (x, y, z) or None if invalid.
     """
     try:
         parts = [float(p) for p in coords_str.split('_')]
@@ -39,7 +43,7 @@ def parse_coords(coords_str: str):
         pass
     return None
 
-    
+
 def create_app():
     app = Flask(__name__)
 
@@ -67,40 +71,46 @@ def create_app():
             with engine.connect() as conn:
                 result = conn.execute(text(sql), {"term_a": term_a, "term_b": term_b})
                 study_ids = [row[0] for row in result]
-            
-            payload = {
+            return jsonify({
                 "term_a": term_a,
                 "term_b": term_b,
                 "study_ids": study_ids,
-            }
-            return jsonify(payload), 200
-
+            }), 200
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            return jsonify({"error": f"Database error: {str(e)}"}), 500
 
     @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
     def dissociate_by_location(coords_a, coords_b):
         """
         Returns studies with activations near coords_a but NOT near coords_b.
-        A `radius` (in mm) can be provided as a query parameter.
+        A 'radius' (in mm) can be provided as a query parameter.
         """
-        radius = request.args.get('radius', default=10, type=float)
-        
+        radius = request.args.get("radius", default=10, type=float)
+
         p_a = parse_coords(coords_a)
         p_b = parse_coords(coords_b)
 
         if p_a is None or p_b is None:
             abort(400, description="Invalid coordinate format. Use x_y_z (e.g., '0_-52_26').")
 
+        # Ensure PostGIS function uses SRID
         sql = """
             SELECT study_id FROM ns.coordinates
-            WHERE ST_DWithin(geom, ST_MakePoint(:x_a, :y_a, :z_a), :radius)
+            WHERE ST_DWithin(
+                geom,
+                ST_SetSRID(ST_MakePoint(:x_a, :y_a, :z_a), 4326),
+                :radius
+            )
             EXCEPT
             SELECT study_id FROM ns.coordinates
-            WHERE ST_DWithin(geom, ST_MakePoint(:x_b, :y_b, :z_b), :radius)
+            WHERE ST_DWithin(
+                geom,
+                ST_SetSRID(ST_MakePoint(:x_b, :y_b, :z_b), 4326),
+                :radius
+            )
             LIMIT 250;
         """
+
         try:
             engine = get_engine()
             with engine.connect() as conn:
@@ -113,18 +123,19 @@ def create_app():
                     }
                 )
                 study_ids = [row[0] for row in result]
-            
-            payload = {
+
+            return jsonify({
                 "coords_a": coords_a,
                 "coords_b": coords_b,
                 "radius": radius,
+                "count": len(study_ids),
                 "study_ids": study_ids,
-            }
-            return jsonify(payload), 200
+            }), 200
 
+        except OperationalError as e:
+            return jsonify({"error": f"Database connection failed: {str(e)}"}), 500
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
+            return jsonify({"error": f"Query failed: {str(e)}"}), 500
 
     @app.get("/test_db", endpoint="test_db")
     def test_db():
@@ -135,33 +146,24 @@ def create_app():
         try:
             engine = get_engine()
             with engine.connect() as conn:
-                # Counts
                 payload["coordinates_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.coordinates")).scalar()
                 payload["metadata_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
                 payload["annotations_terms_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
 
-                # Samples
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
-                    )).mappings().all()
-                    payload["coordinates_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["coordinates_sample"] = []
+                rows = conn.execute(text(
+                    "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
+                )).mappings().all()
+                payload["coordinates_sample"] = [dict(r) for r in rows]
 
-                try:
-                    rows = conn.execute(text("SELECT study_id, title, year FROM ns.metadata LIMIT 3")).mappings().all()
-                    payload["metadata_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["metadata_sample"] = []
+                rows = conn.execute(text(
+                    "SELECT study_id, title, year FROM ns.metadata LIMIT 3"
+                )).mappings().all()
+                payload["metadata_sample"] = [dict(r) for r in rows]
 
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
-                    )).mappings().all()
-                    payload["annotations_terms_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["annotations_terms_sample"] = []
+                rows = conn.execute(text(
+                    "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
+                )).mappings().all()
+                payload["annotations_terms_sample"] = [dict(r) for r in rows]
 
             payload["ok"] = True
             return jsonify(payload), 200
@@ -172,5 +174,6 @@ def create_app():
 
     return app
 
-# WSGI entry point (no __main__)
+
+# WSGI entry point
 app = create_app()
