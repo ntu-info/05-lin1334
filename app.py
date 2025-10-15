@@ -83,9 +83,12 @@ def create_app():
     def dissociate_by_location(coords_a, coords_b):
         """
         Returns studies with activations near coords_a but NOT near coords_b.
-        A 'radius' (in mm) can be provided as a query parameter.
+        Optional query parameters:
+            - radius (float, default=10): search radius in mm
+            - bidirectional (bool, default=false): return both A–B and B–A
         """
         radius = request.args.get("radius", default=10, type=float)
+        bidirectional = request.args.get("bidirectional", default="false").lower() == "true"
 
         p_a = parse_coords(coords_a)
         p_b = parse_coords(coords_b)
@@ -93,19 +96,18 @@ def create_app():
         if p_a is None or p_b is None:
             abort(400, description="Invalid coordinate format. Use x_y_z (e.g., '0_-52_26').")
 
-        # Ensure PostGIS function uses SRID
         sql = """
             SELECT study_id FROM ns.coordinates
             WHERE ST_DWithin(
                 geom,
-                ST_SetSRID(ST_MakePoint(:x_a, :y_a, :z_a), 4326),
+                ST_SetSRID(ST_MakePoint(:x1, :y1, :z1), 4326),
                 :radius
             )
             EXCEPT
             SELECT study_id FROM ns.coordinates
             WHERE ST_DWithin(
                 geom,
-                ST_SetSRID(ST_MakePoint(:x_b, :y_b, :z_b), 4326),
+                ST_SetSRID(ST_MakePoint(:x2, :y2, :z2), 4326),
                 :radius
             )
             LIMIT 250;
@@ -114,23 +116,49 @@ def create_app():
         try:
             engine = get_engine()
             with engine.connect() as conn:
-                result = conn.execute(
+                # Direction A → B
+                res_ab = conn.execute(
                     text(sql),
                     {
-                        "x_a": p_a[0], "y_a": p_a[1], "z_a": p_a[2],
-                        "x_b": p_b[0], "y_b": p_b[1], "z_b": p_b[2],
+                        "x1": p_a[0], "y1": p_a[1], "z1": p_a[2],
+                        "x2": p_b[0], "y2": p_b[1], "z2": p_b[2],
                         "radius": radius
                     }
                 )
-                study_ids = [row[0] for row in result]
+                study_ids_ab = [row[0] for row in res_ab]
 
-            return jsonify({
-                "coords_a": coords_a,
-                "coords_b": coords_b,
-                "radius": radius,
-                "count": len(study_ids),
-                "study_ids": study_ids,
-            }), 200
+                payload = {
+                    "coords_a": coords_a,
+                    "coords_b": coords_b,
+                    "radius": radius,
+                    "direction_A_minus_B": {
+                        "from": coords_a,
+                        "not": coords_b,
+                        "count": len(study_ids_ab),
+                        "study_ids": study_ids_ab
+                    }
+                }
+
+                # If bidirectional requested → compute B → A as well
+                if bidirectional:
+                    res_ba = conn.execute(
+                        text(sql),
+                        {
+                            "x1": p_b[0], "y1": p_b[1], "z1": p_b[2],
+                            "x2": p_a[0], "y2": p_a[1], "z2": p_a[2],
+                            "radius": radius
+                        }
+                    )
+                    study_ids_ba = [row[0] for row in res_ba]
+
+                    payload["direction_B_minus_A"] = {
+                        "from": coords_b,
+                        "not": coords_a,
+                        "count": len(study_ids_ba),
+                        "study_ids": study_ids_ba
+                    }
+
+            return jsonify(payload), 200
 
         except OperationalError as e:
             return jsonify({"error": f"Database connection failed: {str(e)}"}), 500
